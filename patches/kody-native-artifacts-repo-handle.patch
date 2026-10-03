@@ -1,0 +1,328 @@
+diff --git a/packages/worker/src/repo/artifacts.node.test.ts b/packages/worker/src/repo/artifacts.node.test.ts
+index 132247a..a01d043 100644
+--- a/packages/worker/src/repo/artifacts.node.test.ts
++++ b/packages/worker/src/repo/artifacts.node.test.ts
+@@ -432,7 +432,7 @@ test('resolveArtifactDefaultBranchHead reuses a provided token and still works w
+ 	expect(gitMocks.listServerRefs).toHaveBeenCalledTimes(2)
+ })
+ 
+-test('native createToken maps token when JSRPC omits plaintext and defers to REST tokens when both are configured', async () => {
++test('native createToken maps token when JSRPC omits plaintext and ignores a REST 401 when the binding is present', async () => {
+ 	const nativeCreateToken = vi.fn(
+ 		async (): Promise<{ id: string; scope: 'read'; token?: string }> => ({
+ 			id: 'tok_native',
+@@ -469,6 +469,57 @@ test('native createToken maps token when JSRPC omits plaintext and defers to RES
+ 		'Artifacts native createToken failed: Artifacts createToken result is missing plaintext.',
+ 	)
+ 
++	const restFetch = mockFetch(() =>
++		apiResponse(null, {
++			status: 401,
++			errors: [{ code: 10000, message: 'Authentication error' }],
++		}),
++	)
++	nativeCreateToken.mockClear()
++	const hybridBinding = getArtifactsBinding({
++		...env,
++		CLOUDFLARE_ACCOUNT_ID: 'acct',
++		CLOUDFLARE_API_TOKEN: 'worker-secret-rejected-by-artifacts',
++	} as unknown as Env)
++	const hybrid = await hybridBinding.get('repo-1')
++	if (hybrid.status !== 'ready') {
++		throw new Error('expected hybrid native repo to be ready')
++	}
++	await expect(hybrid.repo.info()).resolves.toMatchObject({
++		remote: remoteFor('repo-1', 'production'),
++	})
++	await expect(hybrid.repo.createToken('read', 120)).resolves.toEqual({
++		id: 'tok_native',
++		plaintext: 'art_v2_read?expires=1760000100',
++		scope: 'read',
++		expiresAt: '2025-10-09T08:55:00.000Z',
++	})
++	await expect(
++		hybridBinding.repo('repo-1').createToken('read', 120),
++	).resolves.toMatchObject({
++		plaintext: 'art_v2_read?expires=1760000100',
++	})
++	expect(nativeCreateToken).toHaveBeenCalledWith('read', 120)
++	expect(restFetch).not.toHaveBeenCalled()
++})
++
++test('native createToken falls back to REST only for the JSRPC split failure, and a REST 401 does not replace that error', async () => {
++	const nativeCreateToken = vi.fn(async () => {
++		throw new Error("Cannot read properties of undefined (reading 'split')")
++	})
++	const env = {
++		ARTIFACTS_NAMESPACE: 'production',
++		ARTIFACTS: {
++			create: vi.fn(),
++			get: vi.fn(async () =>
++				nativeRepoHandle('repo-1', { createToken: nativeCreateToken }),
++			),
++			delete: vi.fn(),
++			list: vi.fn(async () => ({ repos: [], total: 0 })),
++		},
++		CLOUDFLARE_ACCOUNT_ID: 'acct',
++		CLOUDFLARE_API_TOKEN: 'worker-secret',
++	} as unknown as Env
+ 	const restFetch = mockFetch((method, url) =>
+ 		method === 'POST' && url.pathname.endsWith('/tokens')
+ 			? apiResponse({
+@@ -479,27 +530,63 @@ test('native createToken maps token when JSRPC omits plaintext and defers to RES
+ 				})
+ 			: undefined,
+ 	)
+-	nativeCreateToken.mockClear()
+-	const hybrid = await getArtifactsBinding({
+-		...env,
+-		CLOUDFLARE_ACCOUNT_ID: 'acct',
+-		CLOUDFLARE_API_TOKEN: 'mock-email-token',
+-		CLOUDFLARE_API_BASE_URL: 'https://kody-pr-42-mock-cloudflare.example',
+-		CLOUDFLARE_ARTIFACTS_API_TOKEN: 'real-artifacts-token',
+-	} as unknown as Env).get('repo-1')
+-	if (hybrid.status !== 'ready') {
+-		throw new Error('expected hybrid native repo to be ready')
++	const ready = await getArtifactsBinding(env).get('repo-1')
++	if (ready.status !== 'ready') {
++		throw new Error('expected native repo to be ready')
+ 	}
+-	await expect(hybrid.repo.createToken('read', 120)).resolves.toEqual({
++	await expect(ready.repo.createToken('read', 120)).resolves.toEqual({
+ 		id: 'tok_rest',
+ 		plaintext: 'art_v1_rest?expires=1760000100',
+ 		scope: 'read',
+ 		expiresAt: '2026-10-09T08:55:00.000Z',
+ 	})
+-	expect(nativeCreateToken).not.toHaveBeenCalled()
++	expect(nativeCreateToken).toHaveBeenCalledWith('read', 120)
+ 	expect(restFetch).toHaveBeenCalledTimes(1)
+-	const restUrl = new URL(String(restFetch.mock.calls[0]?.[0]))
+-	expect(restUrl.origin).toBe('https://api.cloudflare.com')
++
++	const denied = mockFetch(() =>
++		apiResponse(null, {
++			status: 401,
++			errors: [{ code: 10000, message: 'Authentication error' }],
++		}),
++	)
++	nativeCreateToken.mockClear()
++	const deniedRepo = await getArtifactsBinding(env).get('repo-1')
++	if (deniedRepo.status !== 'ready') {
++		throw new Error('expected native repo to be ready')
++	}
++	await expect(deniedRepo.repo.createToken('read', 120)).rejects.toThrow(
++		/Artifacts native createToken failed: Cannot read properties of undefined \(reading 'split'\)/,
++	)
++	expect(denied).toHaveBeenCalled()
++})
++
++test('fork keeps REST on api.cloudflare.com when preview points CLOUDFLARE_API_BASE_URL at a mock', async () => {
++	const restFetch = mockFetch((method, url) => {
++		expect(method).toBe('POST')
++		expect(url.origin).toBe('https://api.cloudflare.com')
++		expect(url.pathname).toContain('/repos/package-origin/fork')
++		return apiResponse(
++			createdRepo('package-dest', 'art_v1_fork?expires=1760000000'),
++		)
++	})
++	await expect(
++		getArtifactsBinding({
++			ARTIFACTS_NAMESPACE: 'production',
++			ARTIFACTS: {
++				create: vi.fn(),
++				get: vi.fn(),
++				delete: vi.fn(),
++				list: vi.fn(async () => ({ repos: [], total: 0 })),
++			},
++			CLOUDFLARE_ACCOUNT_ID: 'acct',
++			CLOUDFLARE_API_TOKEN: 'mock-email-token',
++			CLOUDFLARE_API_BASE_URL: 'https://kody-pr-42-mock-cloudflare.example',
++			CLOUDFLARE_ARTIFACTS_API_TOKEN: 'real-artifacts-token',
++		} as unknown as Env).fork('package-origin', 'package-dest'),
++	).resolves.toMatchObject({
++		name: 'package-dest',
++		token: 'art_v1_fork?expires=1760000000',
++	})
+ 	expect(restFetch.mock.calls[0]?.[1]).toMatchObject({
+ 		headers: expect.objectContaining({
+ 			authorization: 'Bearer real-artifacts-token',
+diff --git a/packages/worker/src/repo/artifacts.ts b/packages/worker/src/repo/artifacts.ts
+index 092da4c..816d1e6 100644
+--- a/packages/worker/src/repo/artifacts.ts
++++ b/packages/worker/src/repo/artifacts.ts
+@@ -277,54 +277,100 @@ async function getNativeRepoOrThrow(native: Artifacts, name: string) {
+ 	}
+ }
+ 
++function nativeRepoInfo(repo: ArtifactsRepo): ArtifactRepoInfo {
++	return {
++		id: repo.id,
++		name: repo.name,
++		description: repo.description,
++		defaultBranch: repo.defaultBranch,
++		createdAt: repo.createdAt,
++		updatedAt: repo.updatedAt,
++		lastPushAt: repo.lastPushAt,
++		source: repo.source,
++		readOnly: repo.readOnly,
++		remote: repo.remote,
++	}
++}
++
++function isArtifactsAuthenticationError(error: unknown) {
++	return getErrorMessage(error) === 'Authentication error'
++}
++
++/**
++ * #1442: native createToken threw inside the binding (`undefined.split`)
++ * across JSRPC, before our plaintext/token mapping ran. That is the only
++ * case that still mints over REST. A rejected Worker API token must not
++ * replace this error.
++ */
++function isNativeCreateTokenJsrpcSplit(error: unknown) {
++	const message = getErrorMessage(error)
++	return (
++		message.includes('undefined.split') || message.includes("reading 'split'")
++	)
++}
++
++async function mintNativeArtifactToken(
++	repo: ArtifactsRepo,
++	scope: 'write' | 'read',
++	ttl: number,
++): Promise<ArtifactToken> {
++	const token = await repo.createToken(scope, ttl)
++	const plaintext = readArtifactTokenPlaintext(token)
++	return {
++		id: token.id,
++		plaintext,
++		scope: token.scope,
++		expiresAt: resolveCreatedTokenExpiry({
++			token: plaintext,
++			tokenExpiresAt:
++				typeof token.expiresAt === 'string' ? token.expiresAt : null,
++		}),
++	}
++}
++
++function wrapNativeCreateTokenError(error: unknown) {
++	return new Error(
++		`Artifacts native createToken failed: ${getErrorMessage(error)}`,
++		{ cause: error },
++	)
++}
++
+ function adaptNativeRepoHandle(
+ 	repo: ArtifactsRepo,
+ 	restRepo?: ArtifactRepoHandle,
+ ): ArtifactRepoHandle {
+ 	return {
+ 		info: async () => {
++			const nativeInfo = nativeRepoInfo(repo)
++			// binding get() already returned the git remote. REST info uses
++			// CLOUDFLARE_API_TOKEN, which is not an Artifacts credential on
++			// self-hosted deploys, and a 401 there used to hide this remote.
++			if (nativeInfo.remote) return nativeInfo
+ 			if (restRepo) {
+-				const info = await restRepo.info()
+-				if (info?.remote) return info
+-			}
+-			return {
+-				id: repo.id,
+-				name: repo.name,
+-				description: repo.description,
+-				defaultBranch: repo.defaultBranch,
+-				createdAt: repo.createdAt,
+-				updatedAt: repo.updatedAt,
+-				lastPushAt: repo.lastPushAt,
+-				source: repo.source,
+-				readOnly: repo.readOnly,
+-				remote: repo.remote,
++				try {
++					const info = await restRepo.info()
++					if (info?.remote) return info
++				} catch (error) {
++					if (!isArtifactsAuthenticationError(error)) throw error
++				}
+ 			}
++			return nativeInfo
+ 		},
+-		createToken: async (scope = 'write', ttl = 3600) => {
+-			// Native createToken still throws `undefined.split` across JSRPC
+-			// after mapping plaintext/token. Mint via REST when credentials
+-			// exist — that path worked before #1437 preferred the binding.
+-			if (restRepo) {
+-				return restRepo.createToken(scope, ttl)
+-			}
++		createToken: async (scope: 'write' | 'read' = 'write', ttl = 3600) => {
+ 			try {
+-				const token = await repo.createToken(scope, ttl)
+-				const plaintext = readArtifactTokenPlaintext(token)
+-				return {
+-					id: token.id,
+-					plaintext,
+-					scope: token.scope,
+-					expiresAt: resolveCreatedTokenExpiry({
+-						token: plaintext,
+-						tokenExpiresAt:
+-							typeof token.expiresAt === 'string' ? token.expiresAt : null,
+-					}),
+-				}
++				return await mintNativeArtifactToken(repo, scope, ttl)
+ 			} catch (error) {
+-				throw new Error(
+-					`Artifacts native createToken failed: ${getErrorMessage(error)}`,
+-					{ cause: error },
+-				)
++				if (!restRepo || !isNativeCreateTokenJsrpcSplit(error)) {
++					throw wrapNativeCreateTokenError(error)
++				}
++				try {
++					return await restRepo.createToken(scope, ttl)
++				} catch (restError) {
++					if (isArtifactsAuthenticationError(restError)) {
++						throw wrapNativeCreateTokenError(error)
++					}
++					throw restError
++				}
+ 			}
+ 		},
+ 		listTokens: async () => {
+@@ -352,12 +398,12 @@ function adaptNativeArtifactsBinding(
+ 			const handle = await getNativeRepoOrThrow(native, name)
+ 			return adaptNativeRepoHandle(handle, rest?.repo(name)).info()
+ 		},
+-		createToken: async (scope = 'write', ttl = 3600) => {
+-			if (rest) {
+-				return rest.repo(name).createToken(scope, ttl)
+-			}
++		createToken: async (scope: 'write' | 'read' = 'write', ttl = 3600) => {
+ 			const handle = await getNativeRepoOrThrow(native, name)
+-			return adaptNativeRepoHandle(handle).createToken(scope, ttl)
++			return adaptNativeRepoHandle(handle, rest?.repo(name)).createToken(
++				scope,
++				ttl,
++			)
+ 		},
+ 		listTokens: async () => {
+ 			const handle = await getNativeRepoOrThrow(native, name)
+@@ -466,11 +512,13 @@ function createArtifactsRestBinding(env: Env, namespace: string) {
+ 	if (!accountId || !apiToken) {
+ 		return null
+ 	}
+-	// When the Worker binds real Artifacts (production/preview), createToken
+-	// and fork mint via REST. Preview also sets CLOUDFLARE_API_BASE_URL to a
+-	// per-PR mock for email/analytics — that mock does not hold the binding's
+-	// repos, so create vs restore disagreed (#2749). Prefer the real Cloudflare
+-	// API whenever the native binding is present, using CLOUDFLARE_ARTIFACTS_API_TOKEN
++	// When the Worker binds real Artifacts (production/preview), fork still
++	// mints via REST. info() and createToken() on a native repo handle use
++	// the binding instead: CLOUDFLARE_API_TOKEN is not an Artifacts
++	// credential. Preview also sets CLOUDFLARE_API_BASE_URL to a per-PR mock
++	// for email/analytics — that mock does not hold the binding's repos, so
++	// create vs restore disagreed (#2749). Prefer the real Cloudflare API
++	// whenever the native binding is present, using CLOUDFLARE_ARTIFACTS_API_TOKEN
+ 	// when the shared CLOUDFLARE_API_TOKEN is the mock credential.
+ 	const native = readNativeArtifactsBinding(env)
+ 	const configuredBaseUrl = env.CLOUDFLARE_API_BASE_URL?.trim()
